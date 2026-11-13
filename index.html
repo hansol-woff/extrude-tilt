@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0e0e12">
+<title>Extrude Tilt</title>
+<style>
+  :root { --bg:#0e0e12; --fg:#f4f4f6; --muted:#8a8a96; --accent:#ff5a36; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Pretendard",sans-serif; }
+  canvas { display:block; touch-action:none; }
+  .ui { position:fixed; left:0; right:0; bottom:0; padding:16px 16px calc(16px + env(safe-area-inset-bottom));
+    display:flex; flex-direction:column; gap:10px; background:linear-gradient(transparent, rgba(0,0,0,.7)); }
+  .row { display:flex; gap:8px; }
+  button, label.btn { flex:1; border:0; border-radius:14px; padding:14px; font-size:15px; font-weight:600;
+    background:#22222a; color:var(--fg); text-align:center; cursor:pointer; }
+  .primary { background:var(--accent) !important; color:#fff; }
+  input[type=file] { display:none; }
+  .slider { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
+  .slider input { flex:1; accent-color:var(--accent); }
+  .hint { position:fixed; top:calc(16px + env(safe-area-inset-top)); left:0; right:0; text-align:center;
+    font-size:13px; color:var(--muted); pointer-events:none; }
+</style>
+</head>
+<body>
+<div class="hint" id="hint">SVG 또는 PNG를 올려보세요 · 폰을 기울이면 움직여요</div>
+<div class="ui">
+  <div class="slider">깊이 <input id="depth" type="range" min="2" max="60" value="20"></div>
+  <div class="row">
+    <label class="btn primary" for="file">이미지 선택</label>
+    <button id="tilt">기울기 켜기</button>
+  </div>
+  <input id="file" type="file" accept=".svg,image/svg+xml,image/png">
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e0e12);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(0, 0, 9);
+
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(3, 4, 6); scene.add(key);
+scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+const pivot = new THREE.Group(); scene.add(pivot);
+let current = null, lastSource = null;
+const depthEl = document.getElementById('depth');
+
+// ---------- builders ----------
+function fitAndCenter(obj, target = 4) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const s = target / Math.max(size.x, size.y);
+  obj.scale.multiplyScalar(s);
+  const c = new THREE.Box3().setFromObject(obj).getCenter(new THREE.Vector3());
+  obj.position.sub(c);
+}
+
+function buildFromSVG(text) {
+  const data = new SVGLoader().parse(text);
+  const group = new THREE.Group();
+  const depth = +depthEl.value;
+  data.paths.forEach(path => {
+    const fill = path.userData?.style?.fill;
+    if (fill === 'none') return;
+    const color = new THREE.Color().setStyle(fill && fill !== 'none' ? fill : '#ffffff');
+    const mat = new THREE.MeshPhysicalMaterial({ color, metalness:0.2, roughness:0.35, clearcoat:0.6 });
+    SVGLoader.createShapes(path).forEach(shape => {
+      const geo = new THREE.ExtrudeGeometry(shape, {
+        depth, bevelEnabled:true, bevelThickness:depth*0.08, bevelSize:depth*0.05, bevelSegments:3, curveSegments:16
+      });
+      group.add(new THREE.Mesh(geo, mat));
+    });
+  });
+  group.scale.y = -1; // SVG y-down → three y-up
+  const wrap = new THREE.Group(); wrap.add(group);
+  fitAndCenter(wrap);
+  return wrap;
+}
+
+function buildFromPNG(img) {
+  // 투명 PNG를 얇은 레이어로 겹겹이 쌓아 두께를 만든다 (프로토타입용)
+  const tex = new THREE.Texture(img); tex.colorSpace = THREE.SRGBColorSpace; tex.needsUpdate = true;
+  const aspect = img.width / img.height;
+  const w = aspect >= 1 ? 4 : 4*aspect, h = aspect >= 1 ? 4/aspect : 4;
+  const layers = 32, thickness = +depthEl.value / 60;
+  const group = new THREE.Group();
+  const geo = new THREE.PlaneGeometry(w, h);
+  for (let i = 0; i < layers; i++) {
+    const t = i / (layers - 1);
+    const shade = i === layers - 1 ? 1 : 0.35 + 0.4 * t;
+    const mat = new THREE.MeshBasicMaterial({ map:tex, alphaTest:0.5, side:THREE.DoubleSide,
+      color:new THREE.Color(shade, shade, shade) });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.z = (t - 0.5) * thickness;
+    group.add(m);
+  }
+  return group;
+}
+
+function setObject(obj) {
+  if (current) { pivot.remove(current); current.traverse(o => { o.geometry?.dispose(); }); }
+  current = obj; pivot.add(obj);
+  document.getElementById('hint').textContent = '폰을 기울이거나 화면을 드래그해보세요';
+}
+
+function rebuild() {
+  if (!lastSource) return;
+  setObject(lastSource.type === 'svg' ? buildFromSVG(lastSource.data) : buildFromPNG(lastSource.data));
+}
+
+document.getElementById('file').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  const reader = new FileReader();
+  if (f.type === 'image/svg+xml' || f.name.toLowerCase().endsWith('.svg')) {
+    reader.onload = () => { lastSource = { type:'svg', data:reader.result }; rebuild(); };
+    reader.readAsText(f);
+  } else {
+    reader.onload = () => { const img = new Image();
+      img.onload = () => { lastSource = { type:'png', data:img }; rebuild(); };
+      img.src = reader.result; };
+    reader.readAsDataURL(f);
+  }
+});
+depthEl.addEventListener('input', rebuild);
+
+// 기본 데모: 별 모양 SVG
+lastSource = { type:'svg', data:`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <path fill="#ff5a36" d="M50 5 61 38 96 38 68 59 79 93 50 72 21 93 32 59 4 38 39 38Z"/></svg>` };
+rebuild();
+document.getElementById('hint').textContent = 'SVG 또는 PNG를 올려보세요 · 폰을 기울이면 움직여요';
+
+// ---------- 기울기 / 드래그 입력 ----------
+const target = { x:0, y:0 };
+let base = null;
+function onOrient(e) {
+  if (e.beta == null) return;
+  if (!base) base = { beta:e.beta, gamma:e.gamma };
+  const clamp = v => Math.max(-45, Math.min(45, v));
+  target.x = THREE.MathUtils.degToRad(clamp(e.beta - base.beta)) * 1.2;
+  target.y = THREE.MathUtils.degToRad(clamp(e.gamma - base.gamma)) * 1.2;
+}
+const tiltBtn = document.getElementById('tilt');
+tiltBtn.addEventListener('click', async () => {
+  try {
+    if (typeof DeviceOrientationEvent?.requestPermission === 'function') {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== 'granted') { tiltBtn.textContent = '권한 거부됨'; return; }
+    }
+    base = null;
+    addEventListener('deviceorientation', onOrient);
+    tiltBtn.textContent = '기준 재설정';
+  } catch { tiltBtn.textContent = '지원 안 됨'; }
+});
+
+let drag = null;
+renderer.domElement.addEventListener('pointerdown', e => drag = { x:e.clientX, y:e.clientY, tx:target.x, ty:target.y });
+addEventListener('pointermove', e => { if (!drag) return;
+  target.y = drag.ty + (e.clientX - drag.x) * 0.01;
+  target.x = drag.tx + (e.clientY - drag.y) * 0.01; });
+addEventListener('pointerup', () => drag = null);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  pivot.rotation.x += (target.x - pivot.rotation.x) * 0.1;
+  pivot.rotation.y += (target.y - pivot.rotation.y) * 0.1;
+  pivot.position.y = Math.sin(t * 1.5) * 0.05;
+  key.position.x = 3 + pivot.rotation.y * 4;
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
