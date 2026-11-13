@@ -6,33 +6,44 @@
 <meta name="theme-color" content="#0e0e12">
 <title>Extrude Tilt</title>
 <style>
-  :root { --bg:#0e0e12; --fg:#f4f4f6; --muted:#8a8a96; --accent:#ff5a36; }
+  :root { --bg:#0e0e12; --fg:#f4f4f6; --muted:#8a8a96; --accent:#ff5a36; --chip:#1d1d24; }
   * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
   html,body { height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
     font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Pretendard",sans-serif; }
   canvas { display:block; touch-action:none; }
-  .ui { position:fixed; left:0; right:0; bottom:0; padding:16px 16px calc(16px + env(safe-area-inset-bottom));
-    display:flex; flex-direction:column; gap:10px; background:linear-gradient(transparent, rgba(0,0,0,.7)); }
-  .row { display:flex; gap:8px; }
-  button, label.btn { flex:1; border:0; border-radius:14px; padding:14px; font-size:15px; font-weight:600;
-    background:#22222a; color:var(--fg); text-align:center; cursor:pointer; }
-  .primary { background:var(--accent) !important; color:#fff; }
-  input[type=file] { display:none; }
-  .slider { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
-  .slider input { flex:1; accent-color:var(--accent); }
   .hint { position:fixed; top:calc(16px + env(safe-area-inset-top)); left:0; right:0; text-align:center;
     font-size:13px; color:var(--muted); pointer-events:none; }
+  .ui { position:fixed; left:0; right:0; bottom:0; padding:12px 0 calc(14px + env(safe-area-inset-bottom));
+    display:flex; flex-direction:column; gap:10px; background:linear-gradient(transparent, rgba(0,0,0,.75)); }
+  .mats { display:flex; gap:8px; overflow-x:auto; padding:0 16px; scrollbar-width:none; justify-content:safe center; }
+  .mats::-webkit-scrollbar { display:none; }
+  .mat { flex:none; display:flex; align-items:center; gap:7px; border:1px solid transparent; border-radius:999px;
+    padding:7px 12px 7px 7px; background:var(--chip); color:var(--fg); font-size:13px; cursor:pointer; }
+  .mat i { width:18px; height:18px; border-radius:50%; display:block; }
+  .mat.on { border-color:var(--accent); background:#2a1a16; }
+  .row { display:flex; justify-content:center; gap:8px; padding:0 16px; }
+  .btn { border:0; border-radius:999px; padding:9px 16px; font-size:13px; font-weight:600;
+    background:var(--chip); color:var(--fg); cursor:pointer; }
+  .btn.primary { background:var(--accent); color:#fff; }
+  input[type=file] { display:none; }
+  .drop { position:fixed; inset:12px; border:2px dashed var(--accent); border-radius:20px; display:none;
+    align-items:center; justify-content:center; font-size:18px; font-weight:600; color:var(--accent);
+    background:rgba(255,90,54,.06); pointer-events:none; }
+  body.dragging .drop { display:flex; }
+  .touch-only { display:none; }
+  body.touch .touch-only { display:inline-block; }
 </style>
 </head>
 <body>
-<div class="hint" id="hint">SVG 또는 PNG를 올려보세요 · 폰을 기울이면 움직여요</div>
+<div class="hint" id="hint"></div>
+<div class="drop">여기에 놓으면 바로 3D로 바뀌어요</div>
 <div class="ui">
-  <div class="slider">깊이 <input id="depth" type="range" min="2" max="60" value="20"></div>
+  <div class="mats" id="mats"></div>
   <div class="row">
     <label class="btn primary" for="file">이미지 선택</label>
-    <button id="tilt">기울기 켜기</button>
+    <button class="btn touch-only" id="tilt">기울기 켜기</button>
   </div>
-  <input id="file" type="file" accept=".svg,image/svg+xml,image/png">
+  <input id="file" type="file" accept=".svg,.png,.webp,.jpg,.jpeg,image/svg+xml,image/png,image/webp,image/jpeg">
 </div>
 
 <script type="importmap">
@@ -46,6 +57,15 @@ import * as THREE from 'three';
 import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
+const DEPTH_RATIO = 0.24;   // 두께 = 형태 크기의 24% (예전 슬라이더 40% 지점)
+const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+if (isTouch) document.body.classList.add('touch');
+const hint = document.getElementById('hint');
+const DEFAULT_HINT = isTouch ? 'SVG·PNG·WebP를 올리고 폰을 기울여보세요'
+                             : 'SVG·PNG·WebP 파일을 끌어다 놓으세요 · 드래그로 회전';
+hint.textContent = DEFAULT_HINT;
+
+// ---------- renderer / scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
@@ -63,34 +83,87 @@ const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(3, 4, 6)
 scene.add(new THREE.AmbientLight(0xffffff, 0.3));
 
 const pivot = new THREE.Group(); scene.add(pivot);
-let current = null, lastSource = null;
-const depthEl = document.getElementById('depth');
+let current = null;
 
-// ---------- builders ----------
+// ---------- materials ----------
+const MATERIALS = [
+  { id:'original', name:'원본',     swatch:'linear-gradient(135deg,#ff8a5c,#ff5a36)', p:{ metalness:0.1, roughness:0.35, clearcoat:0.6 } },
+  { id:'matte',    name:'매트',     swatch:'#b9b2a8', p:{ metalness:0, roughness:0.9 } },
+  { id:'chrome',   name:'크롬',     swatch:'linear-gradient(135deg,#fff,#8a8f99 50%,#eee)', color:'#eceef2', p:{ metalness:1, roughness:0.06 } },
+  { id:'gold',     name:'골드',     swatch:'linear-gradient(135deg,#ffe29a,#c8962e)', color:'#e3b04b', p:{ metalness:1, roughness:0.2 } },
+  { id:'glass',    name:'유리',     swatch:'linear-gradient(135deg,rgba(255,255,255,.9),rgba(140,200,255,.35))', p:{ metalness:0, roughness:0.04, transmission:1, thickness:1.2, ior:1.5, clearcoat:1 } },
+  { id:'jelly',    name:'젤리',     swatch:'linear-gradient(135deg,#ffb3c7,#ff6f91)', p:{ metalness:0, roughness:0.25, transmission:0.65, thickness:2, ior:1.35, clearcoat:1 } },
+  { id:'holo',     name:'홀로그램', swatch:'linear-gradient(135deg,#9ff,#f9f,#ff9)', color:'#ffffff', p:{ metalness:0.7, roughness:0.15, iridescence:1, iridescenceIOR:1.8, iridescenceThicknessRange:[200,800] } },
+];
+let currentMat = MATERIALS[0];
+
+function makeMaterial(slot, preset) {
+  const override = !!preset.color;
+  return new THREE.MeshPhysicalMaterial({
+    color: override ? new THREE.Color(preset.color) : slot.color.clone(),
+    map: override ? null : (slot.map || null),
+    ...preset.p,
+  });
+}
+function applyMaterial(preset) {
+  currentMat = preset;
+  document.querySelectorAll('.mat').forEach(b => b.classList.toggle('on', b.dataset.id === preset.id));
+  if (!current) return;
+  current.traverse(o => {
+    if (!o.isMesh || !o.userData.slots) return;
+    const old = Array.isArray(o.material) ? o.material : [o.material];
+    old.forEach(m => m.dispose());
+    const mats = o.userData.slots.map(s => makeMaterial(s, preset));
+    o.material = mats.length === 1 ? mats[0] : mats;
+  });
+}
+const matsEl = document.getElementById('mats');
+MATERIALS.forEach(m => {
+  const b = document.createElement('button');
+  b.className = 'mat'; b.dataset.id = m.id;
+  b.innerHTML = `<i style="background:${m.swatch}"></i>${m.name}`;
+  b.onclick = () => applyMaterial(m);
+  matsEl.appendChild(b);
+});
+
+// ---------- geometry builders ----------
 function fitAndCenter(obj, target = 4) {
-  const box = new THREE.Box3().setFromObject(obj);
-  const size = box.getSize(new THREE.Vector3());
-  const s = target / Math.max(size.x, size.y);
-  obj.scale.multiplyScalar(s);
+  const size = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+  obj.scale.multiplyScalar(target / Math.max(size.x, size.y));
   const c = new THREE.Box3().setFromObject(obj).getCenter(new THREE.Vector3());
   obj.position.sub(c);
 }
+function shapesSize(shapes) {
+  const b = new THREE.Box2();
+  shapes.forEach(s => s.getPoints(4).forEach(p => b.expandByPoint(p)));
+  const s = b.getSize(new THREE.Vector2());
+  return Math.max(s.x, s.y) || 1;
+}
 
-function buildFromSVG(text) {
+// SVG 문자열 → 돌출 메쉬. capSlot이 있으면(래스터) 앞뒷면엔 이미지, 옆면엔 평균색
+function buildFromSVG(text, raster) {
   const data = new SVGLoader().parse(text);
-  const group = new THREE.Group();
-  const depth = +depthEl.value;
+  const items = [];
   data.paths.forEach(path => {
     const fill = path.userData?.style?.fill;
     if (fill === 'none') return;
-    const color = new THREE.Color().setStyle(fill && fill !== 'none' ? fill : '#ffffff');
-    const mat = new THREE.MeshPhysicalMaterial({ color, metalness:0.2, roughness:0.35, clearcoat:0.6 });
-    SVGLoader.createShapes(path).forEach(shape => {
-      const geo = new THREE.ExtrudeGeometry(shape, {
-        depth, bevelEnabled:true, bevelThickness:depth*0.08, bevelSize:depth*0.05, bevelSegments:3, curveSegments:16
-      });
-      group.add(new THREE.Mesh(geo, mat));
+    const shapes = SVGLoader.createShapes(path);
+    if (shapes.length) items.push({ shapes, color: new THREE.Color().setStyle(fill && fill !== 'none' ? fill : '#ffffff') });
+  });
+  if (!items.length) throw new Error('채워진 도형이 없는 SVG예요');
+  const size = shapesSize(items.flatMap(i => i.shapes));
+  const depth = size * DEPTH_RATIO;
+  const group = new THREE.Group();
+  items.forEach(({ shapes, color }) => {
+    const geo = new THREE.ExtrudeGeometry(shapes, {
+      depth, bevelEnabled:true, bevelThickness:depth*0.06,
+      bevelSize: size * (raster ? 0.004 : 0.008), bevelSegments:3, curveSegments:16,
     });
+    const mesh = new THREE.Mesh(geo);
+    mesh.userData.slots = raster
+      ? [{ color:new THREE.Color(1,1,1), map:raster.tex }, { color:raster.edge }]   // [앞뒷면, 옆면]
+      : [{ color }];
+    group.add(mesh);
   });
   group.scale.y = -1; // SVG y-down → three y-up
   const wrap = new THREE.Group(); wrap.add(group);
@@ -98,59 +171,129 @@ function buildFromSVG(text) {
   return wrap;
 }
 
-function buildFromPNG(img) {
-  // 투명 PNG를 얇은 레이어로 겹겹이 쌓아 두께를 만든다 (프로토타입용)
-  const tex = new THREE.Texture(img); tex.colorSpace = THREE.SRGBColorSpace; tex.needsUpdate = true;
-  const aspect = img.width / img.height;
-  const w = aspect >= 1 ? 4 : 4*aspect, h = aspect >= 1 ? 4/aspect : 4;
-  const layers = 32, thickness = +depthEl.value / 60;
-  const group = new THREE.Group();
-  const geo = new THREE.PlaneGeometry(w, h);
-  for (let i = 0; i < layers; i++) {
-    const t = i / (layers - 1);
-    const shade = i === layers - 1 ? 1 : 0.35 + 0.4 * t;
-    const mat = new THREE.MeshBasicMaterial({ map:tex, alphaTest:0.5, side:THREE.DoubleSide,
-      color:new THREE.Color(shade, shade, shade) });
-    const m = new THREE.Mesh(geo, mat);
-    m.position.z = (t - 0.5) * thickness;
-    group.add(m);
+// 래스터(PNG/WebP/JPG) → 알파 윤곽을 추적해 SVG 경로로 만든 뒤 같은 방식으로 돌출
+function buildFromRaster(img) {
+  const MAX = 256;
+  const k = MAX / Math.max(img.width, img.height);
+  const w = Math.max(2, Math.round(img.width * k)), h = Math.max(2, Math.round(img.height * k));
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d', { willReadFrequently:true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data;
+  const solid = new Uint8Array(w * h);
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (px[i*4+3] >= 128) { solid[i] = 1; r += px[i*4]; g += px[i*4+1]; b += px[i*4+2]; n++; }
   }
-  return group;
+  if (!n) throw new Error('불투명한 부분이 없는 이미지예요');
+  const loops = traceContours(solid, w, h);
+  const d = loops.map(l => 'M' + l.map(p => p[0] + ' ' + p[1]).join('L') + 'Z').join('');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}"><path fill="#fff" fill-rule="evenodd" d="${d}"/></svg>`;
+
+  const tex = new THREE.Texture(img);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.repeat.set(1 / w, -1 / h); tex.offset.set(0, 1);   // 캡 UV(픽셀 좌표) → 0..1
+  tex.anisotropy = 4; tex.needsUpdate = true;
+  const edge = new THREE.Color().setRGB(r/n/255, g/n/255, b/n/255, THREE.SRGBColorSpace).multiplyScalar(0.8);
+  return buildFromSVG(svg, { tex, edge });
+}
+
+// 픽셀 경계선을 이어 닫힌 윤곽선을 만들고 단순화
+function traceContours(solid, w, h) {
+  const at = (x, y) => x >= 0 && y >= 0 && x < w && y < h && solid[y*w + x];
+  const out = new Map();   // "x,y" → [[x2,y2], ...]
+  const add = (x1, y1, x2, y2) => {
+    const kk = x1 + ',' + y1; (out.get(kk) || out.set(kk, []).get(kk)).push([x2, y2]);
+  };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!solid[y*w + x]) continue;
+    if (!at(x, y-1)) add(x, y, x+1, y);
+    if (!at(x+1, y)) add(x+1, y, x+1, y+1);
+    if (!at(x, y+1)) add(x+1, y+1, x, y+1);
+    if (!at(x-1, y)) add(x, y+1, x, y);
+  }
+  const loops = [];
+  for (const [startKey, list] of out) {
+    while (list.length) {
+      const [sx, sy] = startKey.split(',').map(Number);
+      const pts = [[sx, sy]];
+      let cur = list.pop();
+      while (!(cur[0] === sx && cur[1] === sy)) {
+        pts.push(cur);
+        const next = out.get(cur[0] + ',' + cur[1]);
+        if (!next || !next.length) break;
+        cur = next.pop();
+      }
+      if (pts.length >= 4) {
+        const s = simplify(pts, 0.9);
+        if (s.length >= 3 && Math.abs(area(s)) >= 6) loops.push(s);
+      }
+    }
+  }
+  return loops;
+}
+function area(p) { let a = 0; for (let i = 0; i < p.length; i++) { const q = p[(i+1) % p.length]; a += p[i][0]*q[1] - q[0]*p[i][1]; } return a / 2; }
+function simplify(pts, eps) {
+  // 닫힌 루프: 가장 먼 두 점으로 나눠 RDP
+  let far = 0, fd = -1;
+  for (let i = 1; i < pts.length; i++) { const dd = (pts[i][0]-pts[0][0])**2 + (pts[i][1]-pts[0][1])**2; if (dd > fd) { fd = dd; far = i; } }
+  const a = rdp(pts.slice(0, far + 1), eps), b = rdp(pts.slice(far).concat([pts[0]]), eps);
+  return a.slice(0, -1).concat(b.slice(0, -1));
+}
+function rdp(p, eps) {
+  if (p.length < 3) return p;
+  const [ax, ay] = p[0], [bx, by] = p[p.length - 1];
+  const len = Math.hypot(bx - ax, by - ay) || 1;
+  let idx = 0, md = 0;
+  for (let i = 1; i < p.length - 1; i++) {
+    const dd = Math.abs((bx - ax) * (ay - p[i][1]) - (ax - p[i][0]) * (by - ay)) / len;
+    if (dd > md) { md = dd; idx = i; }
+  }
+  if (md <= eps) return [p[0], p[p.length - 1]];
+  return rdp(p.slice(0, idx + 1), eps).slice(0, -1).concat(rdp(p.slice(idx), eps));
 }
 
 function setObject(obj) {
-  if (current) { pivot.remove(current); current.traverse(o => { o.geometry?.dispose(); }); }
-  current = obj; pivot.add(obj);
-  document.getElementById('hint').textContent = '폰을 기울이거나 화면을 드래그해보세요';
-}
-
-function rebuild() {
-  if (!lastSource) return;
-  setObject(lastSource.type === 'svg' ? buildFromSVG(lastSource.data) : buildFromPNG(lastSource.data));
-}
-
-document.getElementById('file').addEventListener('change', e => {
-  const f = e.target.files[0]; if (!f) return;
-  const reader = new FileReader();
-  if (f.type === 'image/svg+xml' || f.name.toLowerCase().endsWith('.svg')) {
-    reader.onload = () => { lastSource = { type:'svg', data:reader.result }; rebuild(); };
-    reader.readAsText(f);
-  } else {
-    reader.onload = () => { const img = new Image();
-      img.onload = () => { lastSource = { type:'png', data:img }; rebuild(); };
-      img.src = reader.result; };
-    reader.readAsDataURL(f);
+  if (current) {
+    pivot.remove(current);
+    current.traverse(o => { o.geometry?.dispose(); [].concat(o.material || []).forEach(m => m.dispose()); });
   }
+  current = obj; pivot.add(obj);
+  applyMaterial(currentMat);
+  target.x = target.y = 0;
+}
+
+// ---------- file loading (선택 / 드래그앤드롭 공통) ----------
+async function loadFile(f) {
+  if (!f) return;
+  const name = f.name.toLowerCase();
+  try {
+    if (f.type === 'image/svg+xml' || name.endsWith('.svg')) {
+      setObject(buildFromSVG(await f.text()));
+    } else if (/^image\//.test(f.type) || /\.(png|webp|jpe?g)$/.test(name)) {
+      const url = URL.createObjectURL(f);
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      setObject(buildFromRaster(img));
+    } else {
+      throw new Error('SVG, PNG, WebP, JPG 파일만 돼요');
+    }
+    hint.textContent = DEFAULT_HINT;
+  } catch (e) {
+    hint.textContent = '변환 실패: ' + (e.message || e);
+  }
+}
+document.getElementById('file').addEventListener('change', e => { loadFile(e.target.files[0]); e.target.value = ''; });
+
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+addEventListener('dragleave', e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  loadFile(e.dataTransfer.files[0]);
 });
-depthEl.addEventListener('input', rebuild);
 
-// 기본 데모: 별 모양 SVG
-lastSource = { type:'svg', data:`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <path fill="#ff5a36" d="M50 5 61 38 96 38 68 59 79 93 50 72 21 93 32 59 4 38 39 38Z"/></svg>` };
-rebuild();
-document.getElementById('hint').textContent = 'SVG 또는 PNG를 올려보세요 · 폰을 기울이면 움직여요';
-
-// ---------- 기울기 / 드래그 입력 ----------
+// ---------- 기울기 / 드래그 회전 ----------
 const target = { x:0, y:0 };
 let base = null;
 function onOrient(e) {
@@ -176,14 +319,18 @@ tiltBtn.addEventListener('click', async () => {
 let drag = null;
 renderer.domElement.addEventListener('pointerdown', e => drag = { x:e.clientX, y:e.clientY, tx:target.x, ty:target.y });
 addEventListener('pointermove', e => { if (!drag) return;
-  target.y = drag.ty + (e.clientX - drag.x) * 0.01;
-  target.x = drag.tx + (e.clientY - drag.y) * 0.01; });
+  target.y = drag.ty + (e.clientX - drag.x) * 0.006;
+  target.x = drag.tx + (e.clientY - drag.y) * 0.006; });
 addEventListener('pointerup', () => drag = null);
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
+
+// 기본 데모
+setObject(buildFromSVG(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <path fill="#ff5a36" d="M50 5 61 38 96 38 68 59 79 93 50 72 21 93 32 59 4 38 39 38Z"/></svg>`));
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
